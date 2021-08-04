@@ -1,25 +1,16 @@
 from __future__ import division
 import torch
-from torch.autograd import Variable
 from torch.utils import data
 
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.nn.init as init
-import torch.utils.model_zoo as model_zoo
-from torchvision import models
 
 # general libs
-import cv2
-import matplotlib.pyplot as plt
 from PIL import Image
 import numpy as np
-import math
-import time
 import tqdm
 import os
 import argparse
-import copy
 
 
 ### My libs
@@ -62,6 +53,7 @@ if VIZ:
 palette = Image.open(DATA_ROOT + '/Annotations/480p/blackswan/00000.png').getpalette()
 
 def Run_video(Fs, Ms, num_frames, num_objects, Mem_every=None, Mem_number=None):
+    # Fs: (1, 3, L, H, W), Ms: (1, 11, L, H, W)
     # initialize storage tensors
     if Mem_every:
         to_memorize = [int(i) for i in np.arange(0, num_frames, step=Mem_every)]
@@ -76,24 +68,26 @@ def Run_video(Fs, Ms, num_frames, num_objects, Mem_every=None, Mem_number=None):
     for t in tqdm.tqdm(range(1, num_frames)):
         # memorize
         with torch.no_grad():
+            # 首先将当前帧的前一帧的图像和mask结果送入编码器M，得到key和value
+            # Fs[:,:,t-1] (1, 3, H, W), Es[:,:,t-1] (1, 11, H, W)
             prev_key, prev_value = model(Fs[:,:,t-1], Es[:,:,t-1], torch.tensor([num_objects])) 
 
         if t-1 == 0: # 
             this_keys, this_values = prev_key, prev_value # only prev memory
         else:
-            this_keys = torch.cat([keys, prev_key], dim=3)
-            this_values = torch.cat([values, prev_value], dim=3)
+            this_keys = torch.cat([keys, prev_key], dim=3)  # (1, 11, 128, L, H/16, W/16)  L is the number of reference frames
+            this_values = torch.cat([values, prev_value], dim=3)  # (1, 11, 512, L, H/16, W/16)  L is the number of reference frames
         
         # segment
         with torch.no_grad():
             logit = model(Fs[:,:,t], this_keys, this_values, torch.tensor([num_objects]))
-        Es[:,:,t] = F.softmax(logit, dim=1)
+        Es[:,:,t] = F.softmax(logit, dim=1)  # (1, 11, L, H, W)
         
         # update
         if t-1 in to_memorize:
             keys, values = this_keys, this_values
         
-    pred = np.argmax(Es[0].cpu().numpy(), axis=0).astype(np.uint8)
+    pred = np.argmax(Es[0].cpu().numpy(), axis=0).astype(np.uint8)  # (1, L, H, W)
     return pred, Es
 
 

@@ -44,12 +44,15 @@ class DAVIS_MO_Test(data.Dataset):
 
 
     def To_onehot(self, mask):
+        # mask: (H, W), M: (11, H, W)
         M = np.zeros((self.K, mask.shape[0], mask.shape[1]), dtype=np.uint8)
         for k in range(self.K):
             M[k] = (mask == k).astype(np.uint8)
         return M
     
     def All_to_onehot(self, masks):
+        # masks: (L, H, W)
+        # Ms: (11, L, H, W)
         Ms = np.zeros((self.K, masks.shape[0], masks.shape[1], masks.shape[2]), dtype=np.uint8)
         for n in range(masks.shape[0]):
             Ms[:,n] = self.To_onehot(masks[n])
@@ -61,7 +64,7 @@ class DAVIS_MO_Test(data.Dataset):
         info['name'] = video
         info['num_frames'] = self.num_frames[video]
         info['size_480p'] = self.size_480p[video]
-
+        # N_frames: (L, H, W, 3), N_masks: (L, H, W)
         N_frames = np.empty((self.num_frames[video],)+self.shape[video]+(3,), dtype=np.float32)
         N_masks = np.empty((self.num_frames[video],)+self.shape[video], dtype=np.uint8)
         for f in range(self.num_frames[video]):
@@ -75,6 +78,7 @@ class DAVIS_MO_Test(data.Dataset):
                 N_masks[f] = 255
         
         Fs = torch.from_numpy(np.transpose(N_frames.copy(), (3, 0, 1, 2)).copy()).float()
+        # Fs: (3, L, H, W), Ms: (11, L, H, W)
         if self.single_object:
             N_masks = (N_masks > 0.5).astype(np.uint8) * (N_masks < 255).astype(np.uint8)
             Ms = torch.from_numpy(self.All_to_onehot(N_masks).copy()).float()

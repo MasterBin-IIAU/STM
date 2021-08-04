@@ -66,6 +66,7 @@ class Encoder_M(nn.Module):
         self.register_buffer('std', torch.FloatTensor([0.229, 0.224, 0.225]).view(1,3,1,1))
 
     def forward(self, in_f, in_m, in_o):
+        # in_f: (N, 3, H, W), in_m: (N, 1, H, W), in_o: (N, 1, H, W)  N is the number of tracked instances
         f = (in_f - self.mean) / self.std
         m = torch.unsqueeze(in_m, dim=1).float() # add channel dim
         o = torch.unsqueeze(in_o, dim=1).float() # add channel dim
@@ -105,6 +106,7 @@ class Encoder_Q(nn.Module):
         r2 = self.res2(x)   # 1/4, 256
         r3 = self.res3(r2) # 1/8, 512
         r4 = self.res4(r3) # 1/8, 1024
+        # the original last stage (stride=32) is removed
         return r4, r3, r2, c1, f
 
 
@@ -129,16 +131,18 @@ class Decoder(nn.Module):
         self.ResMM = ResBlock(mdim, mdim)
         self.RF3 = Refine(512, mdim) # 1/8 -> 1/4
         self.RF2 = Refine(256, mdim) # 1/4 -> 1
-
+        # 相当于每个instance单独搞了一个二分类器
         self.pred2 = nn.Conv2d(mdim, 2, kernel_size=(3,3), padding=(1,1), stride=1)
 
     def forward(self, r4, r3, r2):
         m4 = self.ResMM(self.convFM(r4))
+        # r3 (s=8), m4 (s=16)
         m3 = self.RF3(r3, m4) # out: 1/8, 256
+        # r2 (s=4), m3 (s=8)
         m2 = self.RF2(r2, m3) # out: 1/4, 256
 
         p2 = self.pred2(F.relu(m2))
-        
+        # 4倍上采样，得到最终mask
         p = F.interpolate(p2, scale_factor=4, mode='bilinear', align_corners=False)
         return p #, p2, p3, p4
 
@@ -149,10 +153,11 @@ class Memory(nn.Module):
         super(Memory, self).__init__()
  
     def forward(self, m_in, m_out, q_in, q_out):  # m_in: o,c,t,h,w
+        # (N, 128, T, H/16, W/16), (N, 512, T, H/16, W/16), (N, 128, H/16, W/16), (N, 512, H/16, W/16)
         B, D_e, T, H, W = m_in.size()
         _, D_o, _, _, _ = m_out.size()
 
-        mi = m_in.view(B, D_e, T*H*W) 
+        mi = m_in.view(B, D_e, T*H*W)  # (n, 128, T*H/16*W/16)
         mi = torch.transpose(mi, 1, 2)  # b, THW, emb
  
         qi = q_in.view(B, D_e, H*W)  # b, emb, HW
@@ -165,7 +170,7 @@ class Memory(nn.Module):
         mem = torch.bmm(mo, p) # Weighted-sum B, D_o, HW
         mem = mem.view(B, D_o, H, W)
 
-        mem_out = torch.cat([mem, q_out], dim=1)
+        mem_out = torch.cat([mem, q_out], dim=1)  # HERE they use cat rather than sum
 
         return mem_out, p
 
@@ -195,44 +200,49 @@ class STM(nn.Module):
         self.Decoder = Decoder(256)
  
     def Pad_memory(self, mems, num_objects, K):
+        # mems: [(N, 128, H/16, W/16), [N, 512, H/16, W/16])
         pad_mems = []
         for mem in mems:
-            pad_mem = ToCuda(torch.zeros(1, K, mem.size()[1], 1, mem.size()[2], mem.size()[3]))
+            pad_mem = ToCuda(torch.zeros(1, K, mem.size()[1], 1, mem.size()[2], mem.size()[3]))  # (1, 11, C, 1, H/16, W/16)
             pad_mem[0,1:num_objects+1,:,0] = mem
             pad_mems.append(pad_mem)
         return pad_mems
 
-    def memorize(self, frame, masks, num_objects): 
+    def memorize(self, frame, masks, num_objects):
+        # frame (1, 3, H, W), masks (1, 11, H, W)
         # memorize a frame 
         num_objects = num_objects[0].item()
         _, K, H, W = masks.shape # B = 1
-
+        # 如果输入图像分辨率不能被16整除，则加padding使其能够整除
         (frame, masks), pad = pad_divide_by([frame, masks], 16, (frame.size()[2], frame.size()[3]))
 
         # make batch arg list
         B_list = {'f':[], 'm':[], 'o':[]}
         for o in range(1, num_objects+1): # 1 - no
-            B_list['f'].append(frame)
-            B_list['m'].append(masks[:,o])
+            B_list['f'].append(frame)  # (1, 3, H, W)
+            B_list['m'].append(masks[:,o])  # (1, H, W) tracked target
             B_list['o'].append( (torch.sum(masks[:,1:o], dim=1) + \
-                torch.sum(masks[:,o+1:num_objects+1], dim=1)).clamp(0,1) )
+                torch.sum(masks[:,o+1:num_objects+1], dim=1)).clamp(0,1) )  # OTHER tracked targets (excluding the current target) (1, H, W)
 
         # make Batch
         B_ = {}
         for arg in B_list.keys():
+            # RGB图像，当前目标的mask，除当前目标外其他目标的mask
             B_[arg] = torch.cat(B_list[arg], dim=0)
 
         r4, _, _, _, _ = self.Encoder_M(B_['f'], B_['m'], B_['o'])
         k4, v4 = self.KV_M_r4(r4) # num_objects, 128 and 512, H/16, W/16
-        k4, v4 = self.Pad_memory([k4, v4], num_objects=num_objects, K=K)
+        k4, v4 = self.Pad_memory([k4, v4], num_objects=num_objects, K=K)  # (1, 11, 128, 1, H/16, W/16), (1, 11, 512, 1, H/16, W/16)
         return k4, v4
 
     def Soft_aggregation(self, ps, K):
+        # ps: (N, H, W)
         num_objects, H, W = ps.shape
         em = ToCuda(torch.zeros(1, K, H, W)) 
         em[0,0] =  torch.prod(1-ps, dim=0) # bg prob
         em[0,1:num_objects+1] = ps # obj prob
         em = torch.clamp(em, 1e-7, 1-1e-7)
+        # 这一步操作是什么意思？
         logit = torch.log((em /(1-em)))
         return logit
 
@@ -250,13 +260,15 @@ class STM(nn.Module):
         r3e, r2e = r3.expand(num_objects,-1,-1,-1), r2.expand(num_objects,-1,-1,-1)
         
         # memory select kv:(1, K, C, T, H, W)
+        # (N, 128, T, H/16, W/16), (N, 512, T, H/16, W/16), (N, 128, H/16, W/16), (N, 512, H/16, W/16)
         m4, viz = self.Memory(keys[0,1:num_objects+1], values[0,1:num_objects+1], k4e, v4e)
+        # (N, C', H/16, W/16), (N, C', H/8, W/8), (N, C', H/4, W/4)
         logits = self.Decoder(m4, r3e, r2e)
         ps = F.softmax(logits, dim=1)[:,1] # no, h, w  
         #ps = indipendant possibility to belong to each object
         
         logit = self.Soft_aggregation(ps, K) # 1, K, H, W
-
+        # 最后消除掉pad的影响，得到跟原图一样大小的预测结果
         if pad[2]+pad[3] > 0:
             logit = logit[:,:,pad[2]:-pad[3],:]
         if pad[0]+pad[1] > 0:

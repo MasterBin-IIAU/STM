@@ -31,6 +31,7 @@ def ToCuda(xs):
 
 
 def pad_divide_by(in_list, d, in_size):
+    # 如果输入尺寸不能被16整除，则加padding
     out_list = []
     h, w = in_size
     if h % d > 0:
@@ -41,6 +42,7 @@ def pad_divide_by(in_list, d, in_size):
         new_w = w + d - w % d
     else:
         new_w = w
+    # 获取上下左右各个方向上需要padding多少个像素
     lh, uh = int((new_h-h) / 2), int(new_h-h) - int((new_h-h) / 2)
     lw, uw = int((new_w-w) / 2), int(new_w-w) - int((new_w-w) / 2)
     pad_array = (int(lw), int(uw), int(lh), int(uh))
