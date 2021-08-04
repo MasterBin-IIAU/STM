@@ -1,0 +1,1 @@
+python eval_DAVIS.py -g '0' -s val -y 17 -D /data/sdg/tracking_datasets/DAVIS
